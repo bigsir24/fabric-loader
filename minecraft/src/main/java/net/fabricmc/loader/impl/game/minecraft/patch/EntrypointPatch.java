@@ -16,7 +16,6 @@
 
 package net.fabricmc.loader.impl.game.minecraft.patch;
 
-import java.util.List;
 import java.util.ListIterator;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -72,118 +71,17 @@ public class EntrypointPatch extends GamePatch {
 		}
 
 		String gameEntrypoint = null;
-		boolean serverHasFile = true;
+		boolean serverHasFile = false;
 		boolean isApplet = entrypoint.contains("Applet");
 		boolean isDirect = entrypoint.equals("net.minecraft.client.Minecraft");
 		ClassNode mainClass = classSource.apply(entrypoint);
+		gameEntrypoint = mainClass.name;
 
 		if (mainClass == null) {
 			throw new RuntimeException("Could not load main class " + entrypoint + "!");
 		}
 
-		// Main -> Game entrypoint search
-		//
-		// -- CLIENT --
-		// pre-classic: find init() invocation before "Failed to start RubyDung" log message
-		// pre-1.6 (seems to hold to 0.0.11!): find the only non-static non-java-packaged Object field
-		// 1.6.1+: [client].start() [INVOKEVIRTUAL]
-		// 19w04a: [client].<init> [INVOKESPECIAL] -> Thread.start()
-		// -- SERVER --
-		// (1.5-1.7?)-:     Just find it instantiating itself.
-		// (1.6-1.8?)+:     an <init> starting with java.io.File can be assumed to be definite
-		// (20w20b-20w21a): Now has its own main class, that constructs the server class. Find a specific regex string in the class.
-		// (20w22a)+:       Datapacks are now reloaded in main. To ensure that mods load correctly, inject into Main after --safeMode check.
-
 		boolean is20w22aServerOrHigher = false;
-
-		if (type == EnvType.CLIENT) {
-			// pre-1.6 route
-			List<FieldNode> newGameFields = findFields(mainClass,
-					(f) -> !isStatic(f.access) && f.desc.startsWith("L") && !f.desc.startsWith("Ljava/")
-					);
-
-			if (newGameFields.size() == 1) {
-				gameEntrypoint = Type.getType(newGameFields.get(0).desc).getClassName();
-			}
-		}
-
-		if (gameEntrypoint == null) {
-			// main method searches
-			MethodNode mainMethod = findMethod(mainClass, (method) -> method.name.equals("main") && method.desc.equals("([Ljava/lang/String;)V") && isPublicStatic(method.access));
-
-			if (mainMethod == null) {
-				throw new RuntimeException("Could not find main method in " + entrypoint + "!");
-			}
-
-			if (type == EnvType.CLIENT && mainMethod.instructions.size() < 10) {
-				// 22w24+ forwards to another method in the same class instead of processing in main() directly, use that other method instead if that's the case
-				MethodInsnNode invocation = null;
-
-				for (AbstractInsnNode insn : mainMethod.instructions) {
-					MethodInsnNode methodInsn;
-
-					if (invocation == null
-							&& insn.getType() == AbstractInsnNode.METHOD_INSN
-							&& (methodInsn = (MethodInsnNode) insn).owner.equals(mainClass.name)) {
-						// capture first method insn to the same class
-						invocation = methodInsn;
-					} else if (insn.getOpcode() > Opcodes.ALOAD // ignore constant and variable loads as well as NOP, labels and line numbers
-							&& insn.getOpcode() != Opcodes.RETURN) { // and RETURN
-						// found unexpected insn for a simple forwarding method
-						invocation = null;
-						break;
-					}
-				}
-
-				if (invocation != null) { // simple forwarder confirmed, use its target for further processing
-					final MethodInsnNode reqMethod = invocation;
-					mainMethod = findMethod(mainClass, m -> m.name.equals(reqMethod.name) && m.desc.equals(reqMethod.desc));
-				}
-			} else if (type == EnvType.SERVER) {
-				// pre-1.6 method search route
-				MethodInsnNode newGameInsn = (MethodInsnNode) findInsn(mainMethod,
-						(insn) -> insn.getOpcode() == Opcodes.INVOKESPECIAL && ((MethodInsnNode) insn).name.equals("<init>") && ((MethodInsnNode) insn).owner.equals(mainClass.name),
-						false
-						);
-
-				if (newGameInsn != null) {
-					gameEntrypoint = newGameInsn.owner.replace('/', '.');
-					serverHasFile = newGameInsn.desc.startsWith("(Ljava/io/File;");
-				}
-			}
-
-			if (gameEntrypoint == null) {
-				// modern method search routes
-				MethodInsnNode newGameInsn = (MethodInsnNode) findInsn(mainMethod,
-						type == EnvType.CLIENT
-						? (insn) -> (insn.getOpcode() == Opcodes.INVOKESPECIAL || insn.getOpcode() == Opcodes.INVOKEVIRTUAL) && !((MethodInsnNode) insn).owner.startsWith("java/")
-								: (insn) -> insn.getOpcode() == Opcodes.INVOKESPECIAL && ((MethodInsnNode) insn).name.equals("<init>") && hasSuperClass(((MethodInsnNode) insn).owner, mainClass.name, classSource),
-								true
-						);
-
-				// New 20w20b way of finding the server constructor
-				if (newGameInsn == null && type == EnvType.SERVER) {
-					newGameInsn = (MethodInsnNode) findInsn(mainMethod,
-							insn -> (insn instanceof MethodInsnNode) && insn.getOpcode() == Opcodes.INVOKESPECIAL && hasStrInMethod(((MethodInsnNode) insn).owner, "<clinit>", "()V", "^[a-fA-F0-9]{40}$", classSource),
-							false);
-				}
-
-				// Detect 20w22a by searching for a specific log message
-				if (type == EnvType.SERVER && hasStrInMethod(mainClass.name, mainMethod.name, mainMethod.desc, "Safe mode active, only vanilla datapack will be loaded", classSource)) {
-					is20w22aServerOrHigher = true;
-					gameEntrypoint = mainClass.name;
-				}
-
-				if (newGameInsn != null) {
-					gameEntrypoint = newGameInsn.owner.replace('/', '.');
-					serverHasFile = newGameInsn.desc.startsWith("(Ljava/io/File;");
-				}
-			}
-
-			if (gameEntrypoint == null && isDirect && type == EnvType.CLIENT) {
-				gameEntrypoint = mainClass.name;
-			}
-		}
 
 		if (gameEntrypoint == null) {
 			throw new RuntimeException("Could not find game constructor in " + entrypoint + "!");
